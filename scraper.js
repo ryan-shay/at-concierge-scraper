@@ -8,29 +8,56 @@ import fetch from "node-fetch";
 import { chromium } from "playwright";
 import { URL as NodeURL } from "node:url";
 
-// ---- Config ----
-const PAGE_URL   = "https://appointmenttrader.com/concierge";
-const STATE_FILE = "./state.json";
-const WEBHOOK    = process.env.DISCORD_WEBHOOK_URL;
+// =====================
+// Config
+// =====================
+const PAGE_URL = "https://appointmenttrader.com/concierge";
 
-const MAX_ITEMS = 20;           // cap how many cards we parse/post per run
+// Bump this if you ever want to invalidate existing state without touching caches
+const STATE_VERSION = "v1";
+const STATE_FILE = `./state.${STATE_VERSION}.json`;
+
+const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
+
+// FIRST_RUN behavior:
+// - Default true (so the first deploy posts what it sees once).
+// - After first successful run, set to "false" in your workflow env.
+const FIRST_RUN = String(process.env.FIRST_RUN ?? "true").toLowerCase() === "true";
+
+// Optional verbose logs (scraped items, etc.)
+const DEBUG_LOG = String(process.env.DEBUG_LOG ?? "false").toLowerCase() === "true";
+
+const MAX_ITEMS = 20;           // cap how many cards we parse per run
 const STATE_TTL_DAYS = 14;      // prune old hashes
 const DISCORD_DELAY_MS = 750;   // throttle between webhook posts
 const HYDRATION_WAIT_MS = 2500; // wait after DOMContentLoaded
 
-// ---- State helpers ----
+// =====================
+// State helpers
+// =====================
 function loadState() {
   try {
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    return parsed && typeof parsed === "object" && parsed.sent ? parsed : { sent: {} };
-  } catch { return { sent: {} }; }
+    if (!parsed || typeof parsed !== "object") return { version: STATE_VERSION, initialized: false, sent: {} };
+    if (!parsed.sent || typeof parsed.sent !== "object") parsed.sent = {};
+    if (!parsed.version) parsed.version = STATE_VERSION;
+    if (typeof parsed.initialized !== "boolean") parsed.initialized = false;
+    return parsed;
+  } catch {
+    return { version: STATE_VERSION, initialized: false, sent: {} };
+  }
 }
-function saveState(state) { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
 function pruneOld(state) {
   const cutoff = Date.now() - STATE_TTL_DAYS * 24 * 60 * 60 * 1000;
   let removed = 0;
   for (const [k, ts] of Object.entries(state.sent)) {
-    if (typeof ts !== "number" || ts < cutoff) { delete state.sent[k]; removed++; }
+    if (typeof ts !== "number" || ts < cutoff) {
+      delete state.sent[k];
+      removed++;
+    }
   }
   if (removed) console.log(`Pruned ${removed} old entries from state.`);
 }
@@ -38,8 +65,11 @@ function hashItem(obj) {
   return crypto.createHash("sha256").update(JSON.stringify(obj)).digest("hex").slice(0, 16);
 }
 
-// ---- Discord ----
+// =====================
+// Discord helpers
+// =====================
 async function postToDiscord(items) {
+  // Post one message per item (normal mode)
   for (const it of items) {
     const content = [
       `**${it.title || "New Request"}**`,
@@ -64,10 +94,59 @@ async function postToDiscord(items) {
   }
 }
 
-// ---- Scraping ----
-// Use ONLY Locators; iterate with .count() + .nth() to avoid the malformed selector issue.
+// Send a compact summary on FIRST_RUN (minimizes spam; handles 2000-char limit)
+async function postSummaryToDiscord(items) {
+  if (!items.length) {
+    await fetch(WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "ℹ️ Initial seed: no requests visible right now." })
+    });
+    return;
+  }
+
+  const header = `✅ Initial seed: **${items.length}** current request(s) found`;
+  const lines = items.map((it) => {
+    const bits = [
+      `• **${it.title || "Request"}**`,
+      it.when ? `(${it.when})` : null,
+      it.price ? `— ${it.price}` : null
+    ].filter(Boolean).join(" ");
+    const url = it.link || PAGE_URL;
+    return `${bits}\n${url}`;
+  });
+
+  // Chunk into multiple messages if >2000 chars
+  const chunks = [];
+  let buf = header + "\n\n";
+  for (const ln of lines) {
+    if ((buf + ln + "\n\n").length > 1900) {
+      chunks.push(buf.trimEnd());
+      buf = "";
+    }
+    buf += ln + "\n\n";
+  }
+  if (buf.trim()) chunks.push(buf.trimEnd());
+
+  for (const content of chunks) {
+    const res = await fetch(WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content })
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.error("Discord summary post failed:", res.status, txt);
+    }
+    await new Promise(r => setTimeout(r, DISCORD_DELAY_MS));
+  }
+}
+
+// =====================
+// Scraping (Playwright)
+// =====================
+// Use ONLY Locators; iterate with .count() + .nth() to avoid malformed selector issues.
 async function extractCards(page) {
-  // Try containers that include the header text
   let container = page.locator(
     "section:has-text('Recently Posted Requests'), " +
     "div:has-text('Recently Posted Requests'), " +
@@ -135,13 +214,22 @@ async function scrape() {
       if (results.length >= MAX_ITEMS) break;
     }
 
+    if (DEBUG_LOG) {
+      console.log(`Parsed ${results.length} item(s):`);
+      for (const it of results) {
+        console.log(`• ${it.title} | ${it.when} | ${it.price} | ${it.link}`);
+      }
+    }
+
     return results;
   } finally {
     await browser.close().catch(() => {});
   }
 }
 
-// ---- Main ----
+// =====================
+// Main
+// =====================
 async function main() {
   try {
     if (!WEBHOOK) {
@@ -155,16 +243,39 @@ async function main() {
 
     const items = await scrape();
 
-    // Dedup by hash
+    // FIRST RUN MODE: always post a summary of what we currently see,
+    // then mark all of them as sent and set initialized=true.
+    if (FIRST_RUN && !state.initialized) {
+      console.log("FIRST_RUN=true and state not initialized → posting summary of current items.");
+      await postSummaryToDiscord(items);
+
+      // Write all current items into state so future runs dedupe
+      for (const it of items) {
+        const id = hashItem({ t: it.title, m: it.meta, w: it.when, p: it.price, l: it.link });
+        state.sent[id] = Date.now();
+      }
+      state.initialized = true;
+      state.version = STATE_VERSION;
+      state.initialized_at = new Date().toISOString();
+      saveState(state);
+      return;
+    } else if (FIRST_RUN && state.initialized) {
+      console.log("FIRST_RUN=true but state already initialized; acting as normal run to avoid duplicates.");
+    }
+
+    // Normal mode: dedup and post only new ones
     const newOnes = [];
     for (const it of items) {
       const id = hashItem({ t: it.title, m: it.meta, w: it.when, p: it.price, l: it.link });
-      if (!state.sent[id]) { state.sent[id] = Date.now(); newOnes.push(it); }
+      if (!state.sent[id]) {
+        state.sent[id] = Date.now();
+        newOnes.push(it);
+      }
     }
 
     if (!newOnes.length) {
       console.log("No new items.");
-      saveState(state); // still persist pruning
+      saveState(state); // still save in case pruning happened
       return;
     }
 
