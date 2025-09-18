@@ -17,9 +17,11 @@ const PAGE_URL = "https://appointmenttrader.com/concierge";
 const STATE_VERSION = "v1";
 const STATE_FILE = `./state.${STATE_VERSION}.json`;
 
-const WEBHOOK   = process.env.DISCORD_WEBHOOK_URL;
-const FIRST_RUN = String(process.env.FIRST_RUN ?? "true").toLowerCase() === "true";
-const DEBUG_LOG = String(process.env.DEBUG_LOG ?? "false").toLowerCase() === "true";
+const WEBHOOK        = process.env.DISCORD_WEBHOOK_URL;
+const FIRST_RUN      = String(process.env.FIRST_RUN ?? "true").toLowerCase() === "true";
+const DEBUG_LOG      = String(process.env.DEBUG_LOG ?? "false").toLowerCase() === "true";
+// Safety net: if state is empty and FIRST_RUN=false, seed silently to avoid spam.
+const SEED_IF_EMPTY  = String(process.env.SEED_IF_EMPTY ?? "true").toLowerCase() === "true";
 
 const MAX_ITEMS         = 20;   // max cards to parse/post per run
 const STATE_TTL_DAYS    = 14;   // prune old hashes
@@ -50,8 +52,17 @@ function pruneOld(state) {
   }
   if (removed) console.log(`Pruned ${removed} old entries from state.`);
 }
+function normSpace(s) { return (s || "").replace(/\s+/g, " ").trim(); }
 function hashItem(obj) {
-  return crypto.createHash("sha256").update(JSON.stringify(obj)).digest("hex").slice(0, 16);
+  // Normalize to maximize stability across runs
+  const canon = {
+    p: normSpace(obj.price || ""),
+    u: normSpace(obj.user || ""),
+    d: normSpace(obj.desc || "").slice(0, 200), // partial to avoid long churn
+    w: normSpace(obj.when || ""),
+    l: normSpace(obj.link || "")
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(canon)).digest("hex").slice(0, 16);
 }
 
 // =====================
@@ -133,9 +144,9 @@ async function postSummaryToDiscord(items) {
 // =====================
 // Scraping (Playwright)
 // =====================
-// Strictly scope to the exact container shown in your snippet:
-// .home-trending-section that has a .home-trending-title span "Recently Posted Requests",
-// then read rows from .home-trending-searches > .home-trending-item
+// Strictly scope to:
+// .home-trending-section:has(.home-trending-title span:has-text('Recently Posted Requests'))
+//   .home-trending-searches .home-trending-item
 async function scrapeFromTrending(page) {
   const section = page
     .locator(".home-trending-section:has(.home-trending-title span:has-text('Recently Posted Requests'))")
@@ -154,7 +165,8 @@ async function scrapeFromTrending(page) {
   for (let i = 0; i < limit; i++) {
     const row = rows.nth(i);
 
-    const text = (await row.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+    const textRaw = await row.innerText().catch(() => "");
+    const text = normSpace(textRaw);
     if (!text) continue;
 
     const onclick = await row.getAttribute("onclick").catch(() => null);
@@ -177,13 +189,13 @@ async function scrapeFromTrending(page) {
     if (!link) link = PAGE_URL;
 
     // parse fields
-    const price = (text.match(/\$\s*[\d,]+\s*reward/i) || [])[0]?.replace(/\s+reward/i, "") || "";
+    const price = (text.match(/\$\s*[\d,]+\s*reward/i) || [])[0]?.replace(/\s*reward/i, "") || "";
     const userMatch = text.match(/posted by\s+([^:]+):/i);
-    const user = userMatch ? userMatch[1].trim() : "";
+    const user = userMatch ? normSpace(userMatch[1]) : "";
 
     // description is everything after the first colon
     const colonIdx = text.indexOf(":");
-    const desc = colonIdx >= 0 ? text.slice(colonIdx + 1).trim() : "";
+    const desc = colonIdx >= 0 ? normSpace(text.slice(colonIdx + 1)) : "";
 
     // heuristics for when
     const when =
@@ -220,9 +232,7 @@ async function scrape() {
 
     if (DEBUG_LOG) {
       console.log(`Parsed ${items.length} trending item(s):`);
-      for (const it of items) {
-        console.log(`• ${it.price} by ${it.user} — ${it.link}`);
-      }
+      for (const it of items) console.log(`• ${it.price} by ${it.user} — ${it.link}`);
     }
 
     return items;
@@ -247,13 +257,29 @@ async function main() {
 
     const items = await scrape();
 
+    // ---------- Safety net ----------
+    const stateIsEmpty = !state.initialized && Object.keys(state.sent).length === 0;
+    if (stateIsEmpty && !FIRST_RUN && SEED_IF_EMPTY) {
+      console.log("State empty and FIRST_RUN=false → seeding silently (no Discord).");
+      for (const it of items) {
+        const id = hashItem(it);
+        state.sent[id] = Date.now();
+      }
+      state.initialized = true;
+      state.version = STATE_VERSION;
+      state.initialized_at = new Date().toISOString();
+      saveState(state);
+      return;
+    }
+    // -------------------------------
+
     if (FIRST_RUN && !state.initialized) {
       console.log("FIRST_RUN=true and state not initialized → posting summary of current items.");
       await postSummaryToDiscord(items);
 
       // seed state with everything currently visible
       for (const it of items) {
-        const id = hashItem({ t: it.title, d: it.desc, w: it.when, p: it.price, l: it.link });
+        const id = hashItem(it);
         state.sent[id] = Date.now();
       }
       state.initialized = true;
@@ -268,7 +294,7 @@ async function main() {
     // Normal run: post only new ones
     const newOnes = [];
     for (const it of items) {
-      const id = hashItem({ t: it.title, d: it.desc, w: it.when, p: it.price, l: it.link });
+      const id = hashItem(it);
       if (!state.sent[id]) { state.sent[id] = Date.now(); newOnes.push(it); }
     }
 
