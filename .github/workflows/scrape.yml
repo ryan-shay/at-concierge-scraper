@@ -25,16 +25,17 @@ jobs:
           node-version: "20"
           cache: "npm"
 
-      # ⬇️ NEW: use a unique primary key + a fresh prefix so we never hit the old immutable cache
+      # ✅ RESTORE (must be before the scraper)
       - name: Restore state cache
-        uses: actions/cache@v4
+        id: restore_state
+        uses: actions/cache/restore@v4
         with:
           path: state.v1.json
-          key: state2-v1-${{ github.run_id }}         # unique each run
+          key: state2-v1-${{ github.run_id }}     # unique per run
           restore-keys: |
-            state2-v1-                                # pulls the most recent matching cache
+            state2-v1-                            # get most recent prior cache
 
-      # (Optional) Verify pre-state was restored
+      # (optional) sanity check
       - name: Show pre-state
         run: |
           [ -f state.v1.json ] && echo "::group::pre-state" && cat state.v1.json && echo "::endgroup::" || echo "no state"
@@ -48,21 +49,20 @@ jobs:
       - name: Run scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          FIRST_RUN: "false"       # normal mode
-          SEED_IF_EMPTY: "true"    # silently seed if cache missing
+          FIRST_RUN: "false"
+          SEED_IF_EMPTY: "true"
           DEBUG_LOG: "0"
         run: npm run scrape
 
-      # (Optional) Verify state was updated
+      # (optional) verify the state file changed
       - name: Show post-state
         run: |
           [ -f state.v1.json ] && echo "::group::post-state" && cat state.v1.json && echo "::endgroup::" || echo "no state written"
 
-      # ⬇️ Save with the SAME unique key as the restore step
+      # ✅ SAVE (only if we didn't already restore an exact match)
       - name: Save state cache
-        uses: actions/cache@v4
+        if: steps.restore_state.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
           path: state.v1.json
           key: state2-v1-${{ github.run_id }}
-          restore-keys: |
-            state2-v1-
