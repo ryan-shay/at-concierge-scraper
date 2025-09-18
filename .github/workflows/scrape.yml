@@ -1,0 +1,45 @@
+name: scrape-appointmenttrader
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # runs every 10 minutes
+  workflow_dispatch:          # manual "Run workflow" button
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Restore previous state.json so we don't repost duplicates
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-${{ github.ref_name }}
+          restore-keys: |
+            state-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm ci
+
+      # Install Playwright browser binaries on the runner
+      - name: Install Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: npm run scrape
+
+      # Save updated state.json to cache for next run
+      - name: Save state cache
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: |
+            state-

@@ -1,0 +1,12 @@
+{
+  "name": "at-concierge-scraper",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scrape": "node scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.2",
+    "node-fetch": "^3.3.2"
+  }
+}
