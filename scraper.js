@@ -3,7 +3,7 @@ import crypto from "crypto";
 import fetch from "node-fetch";
 import { chromium } from "playwright";
 
-const URL = "https://appointmenttrader.com/concierge";
+const PAGE_URL = "https://appointmenttrader.com/concierge"
 const STATE_FILE = "./state.json";
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 
@@ -47,7 +47,7 @@ async function scrape() {
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
   });
   const page = await ctx.newPage();
-  await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.goto(PAGE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
 
   // In case content is hydrated after load, give it a moment.
   await page.waitForTimeout(2000);
@@ -78,7 +78,7 @@ async function scrape() {
     const when = lines.find(l => /(\d{1,2}:\d{2}|Today|Tomorrow|AM|PM|[A-Za-z]{3,9}\s+\d{1,2})/i) || "";
     const price = lines.find(l => /\$|bounty|offer|reward/i) || "";
 
-    const link = href ? (href.startsWith("http") ? href : new URL(href, URL).toString()) : URL;
+    const link = href ? (href.startsWith("http") ? href : new URL(href, PAGE_URL).toString()) : PAGE_URL;
 
     // Filter obvious non-request noise by keywords
     if (!/request|reserve|table|booking|bounty|offer|help/i.test(text)) continue;
