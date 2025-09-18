@@ -95,9 +95,8 @@ async function postSummaryToDiscord(items) {
   const header = `✅ Initial seed: **${items.length}** current request(s) found`;
   const lines = items.map((it) => {
     const bits = [
-      `• **${it.title || "Request"}**`,
-      it.when ? `(${it.when})` : null,
-      it.price ? `— ${it.price}` : null
+      `• ${it.price || "—"} by **${it.user || "unknown"}**`,
+      it.desc ? `— ${it.desc.slice(0, 120)}${it.desc.length > 120 ? "…" : ""}` : null
     ].filter(Boolean).join(" ");
     return `${bits}\n${it.link || PAGE_URL}`;
   });
@@ -127,33 +126,87 @@ async function postSummaryToDiscord(items) {
 // =====================
 // Scraping (Playwright)
 // =====================
-// Return both cards and whether we are scoped to the "Recently Posted" container.
-async function extractCards(page) {
-  const scopedContainer = page
-    .locator(
-      "section:has-text('Recently Posted Requests'), " +
-      "div:has-text('Recently Posted Requests'), " +
-      "section:has-text('Recently Posted'), " +
-      "div:has-text('Recently Posted')"
-    )
-    .first();
+// We deliberately use a DOM evaluation scoped BELOW the
+// "Recently Posted Requests" header and require the phrase
+// "reward posted by" so we ignore nav/marketing blocks.
+async function scrapeItems(page) {
+  // returns array of { text, hrefs[] } extracted from the correct section
+  return await page.evaluate((maxItems) => {
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-  let scoped = false;
-  let cards = scopedContainer.locator("li, .list-group-item, .card, .row, .request, [data-request], a[href]");
-  let count = await cards.count();
+    // 1) Find the header node
+    const allEls = Array.from(document.querySelectorAll("h1,h2,h3,div,section,span,header,p,strong"));
+    const header = allEls.find(el => /Recently Posted Requests/i.test(el.textContent || ""));
 
-  if (count > 0) {
-    scoped = true;
-  } else {
-    // page-wide heuristic fallback
-    cards = page.locator("li, .list-group-item, .card, .row, .request, [data-request], a[href]");
-    count = await cards.count();
+    // Helper: is A after B in the DOM?
+    const isAfter = (a, b) => !!(b && (b.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING));
+
+    // 2) Collect candidate nodes AFTER the header that contain the target phrase
+    const nodes = Array.from(document.querySelectorAll("li, .list-group-item, .card, .row, .request, [data-request], a, div"));
+    const items = [];
+    const seenTexts = new Set();
+
+    for (const n of nodes) {
+      if (header && !isAfter(n, header)) continue;
+
+      const txt = norm(n.textContent);
+      if (!/reward posted by/i.test(txt)) continue;                // must look like a request row
+      if (/Become a Concierge/i.test(txt)) continue;               // skip the header row button
+      if (txt.length < 20 || txt.length > 4000) continue;          // sanity
+
+      // dedupe by normalized text to avoid nested duplicates
+      const key = txt.slice(0, 400);
+      if (seenTexts.has(key)) continue;
+      seenTexts.add(key);
+
+      const hrefs = Array.from(n.querySelectorAll("a[href]"))
+        .map(a => a.href)
+        .filter(h => !!h);
+
+      items.push({ text: txt, hrefs });
+      if (items.length >= maxItems) break;
+    }
+    return items;
+  }, MAX_ITEMS);
+}
+
+// Parse a raw item object into structured fields
+function parseItem(raw) {
+  const text = raw.text;
+  const reward = (text.match(/\$\s*[\d,]+/g) || [])[0] || "";
+
+  // posted by USER:
+  let user = "";
+  const mUser = text.match(/posted by\s+([^:]+):/i);
+  if (mUser) user = mUser[1].trim();
+
+  // description: after the first colon (post-user)
+  let desc = "";
+  const colonIdx = text.indexOf(":");
+  if (colonIdx !== -1) desc = text.slice(colonIdx + 1).trim();
+
+  // choose a link: prefer external link (not appointmenttrader.com), else first link, else PAGE_URL
+  let link = PAGE_URL;
+  if (Array.isArray(raw.hrefs) && raw.hrefs.length) {
+    const external = raw.hrefs.find(h => !/appointmenttrader\.com/i.test(h));
+    link = external || raw.hrefs[0] || PAGE_URL;
   }
 
-  const list = [];
-  const limit = Math.min(count, MAX_ITEMS);
-  for (let i = 0; i < limit; i++) list.push(cards.nth(i));
-  return { list, scoped };
+  // Optional heuristics for "when"
+  const when =
+    (text.match(/\b(Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b/i) || [])[0] ||
+    (text.match(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}\b/i) || [])[0] ||
+    (text.match(/\b\d{1,2}:\d{2}\s*(AM|PM)?\b/i) || [])[0] || "";
+
+  return {
+    title: `${reward || "Request"} posted by ${user || "user"}`,
+    meta: desc ? desc.slice(0, 140) : "",
+    when,
+    price: reward || "",
+    link,
+    user,
+    desc
+  };
 }
 
 async function scrape() {
@@ -169,51 +222,15 @@ async function scrape() {
     await page.goto(PAGE_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForTimeout(HYDRATION_WAIT_MS);
 
-    const { list: cardLocators, scoped } = await extractCards(page);
-    console.log(`Found ${cardLocators.length} candidate cards.`);
-
-    const results = [];
-    for (const card of cardLocators) {
-      const text = (await card.innerText().catch(() => "")).trim();
-      if (!text) continue;
-
-      // href resolution: prefer element href, else first child <a>
-      let href = await card.getAttribute("href").catch(() => null);
-      if (!href) {
-        const childA = card.locator("a[href]").first();
-        if (await childA.count()) href = await childA.getAttribute("href").catch(() => null);
-      }
-      if (href && href.startsWith("javascript:")) href = null;
-
-      const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
-      const title = lines[0] || "Request";
-      const meta  = lines.slice(1, 3).join(" • ") || "";
-      const when  = lines.find(l =>
-        /(\d{1,2}:\d{2}\s*(AM|PM)?)|Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun|January|February|March|April|May|June|July|August|September|October|November|December/i.test(l)
-      ) || "";
-      const price = lines.find(l => /\$|bounty|offer|reward/i.test(l)) || "";
-
-      const link = href ? (href.startsWith("http") ? href : new NodeURL(href, PAGE_URL).toString()) : PAGE_URL;
-
-      // Filtering logic:
-      // - On FIRST_RUN or when we're scoped to the "Recently Posted" container, accept everything.
-      // - Otherwise (page-wide heuristic), require a keyword match to avoid noise.
-      let accept = true;
-      if (!FIRST_RUN && !scoped) {
-        accept = /request|reserve|reservation|table|booking|bounty|offer|help|looking|need/i.test(text);
-      }
-      if (!accept) continue;
-
-      results.push({ title, meta, when, price, link });
-      if (results.length >= MAX_ITEMS) break;
-    }
+    const raw = await scrapeItems(page);
+    const parsed = raw.map(parseItem);
 
     if (DEBUG_LOG) {
-      console.log(`Parsed ${results.length} item(s):`);
-      for (const it of results) console.log(`• ${it.title} | ${it.when} | ${it.price} | ${it.link}`);
+      console.log(`Parsed ${parsed.length} item(s):`);
+      for (const it of parsed) console.log(`• ${it.price} by ${it.user} — ${it.link}`);
     }
 
-    return results;
+    return parsed;
   } finally {
     await browser.close().catch(() => {});
   }
