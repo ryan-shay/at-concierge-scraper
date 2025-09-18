@@ -2,7 +2,7 @@ name: scrape-appointmenttrader
 
 on:
   schedule:
-    - cron: "*/10 * * * *"    # every 10 minutes
+    - cron: "*/10 * * * *"   # every 10 minutes
   workflow_dispatch:
 
 jobs:
@@ -11,20 +11,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node setup (no npm cache; remove lockfile requirement headaches)
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
 
+      # Restore state file (matches scraper's STATE_FILE = state.v1.json)
       - name: Restore state cache
         uses: actions/cache@v4
         with:
-          path: state.json
-          key: state-${{ github.ref_name }}
+          path: state.v1.json
+          key: state-v1-${{ github.ref_name }}
           restore-keys: |
-            state-
+            state-v1-
 
-      # Use npm install if you don't have package-lock.json committed
       - name: Install deps
         run: npm install
 
@@ -34,15 +34,15 @@ jobs:
       - name: Run scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-	  FIRST_RUN: 'true'
-	  DEBUG_LOG: '1'
+          FIRST_RUN: "true"    # set to "false" after the first successful seed
+          DEBUG_LOG: "1"       # optional; remove later
         run: npm run scrape
 
+      # Save updated state so future runs dedupe correctly
       - name: Save state cache
         uses: actions/cache@v4
         with:
-          path: state.json
-          key: state-${{ github.run_id }}
+          path: state.v1.json
+          key: state-v1-${{ github.run_id }}
           restore-keys: |
-            state-
-
+            state-v1-
