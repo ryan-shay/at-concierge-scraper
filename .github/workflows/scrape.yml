@@ -25,6 +25,7 @@ jobs:
 
       - name: Install deps
         run: npm ci
+	run: npm install
 
       # Install Playwright browser binaries on the runner
       - name: Install Playwright
