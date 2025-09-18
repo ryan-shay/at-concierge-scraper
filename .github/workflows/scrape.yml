@@ -5,45 +5,42 @@ on:
     - cron: "*/10 * * * *"   # every 10 minutes
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: scrape-appointmenttrader
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
 
-      # Restore state file (matches scraper's STATE_FILE = state.v1.json)
+      # ⬇️ NEW: use a unique primary key + a fresh prefix so we never hit the old immutable cache
       - name: Restore state cache
         uses: actions/cache@v4
         with:
           path: state.v1.json
-          key: state-v1-${{ github.ref_name }}
+          key: state2-v1-${{ github.run_id }}         # unique each run
           restore-keys: |
-            state-v1-
+            state2-v1-                                # pulls the most recent matching cache
 
-      # --- Verification: show pre-state (if any) ---
-      - name: Show pre-state (verify cache restore)
+      # (Optional) Verify pre-state was restored
+      - name: Show pre-state
         run: |
-          echo "Repo: $GITHUB_REPOSITORY"
-          echo "Ref:  $GITHUB_REF_NAME"
-          echo "Commit: $GITHUB_SHA"
-          echo "Working directory:"
-          pwd
-          echo "Dir listing:"
-          ls -la
-          if [ -f state.v1.json ]; then
-            echo "::group::pre-state.v1.json"
-            cat state.v1.json
-            echo "::endgroup::"
-          else
-            echo "No pre-existing state.v1.json found (fresh seed likely)."
-          fi
+          [ -f state.v1.json ] && echo "::group::pre-state" && cat state.v1.json && echo "::endgroup::" || echo "no state"
 
       - name: Install deps
-        run: npm install
+        run: npm ci || npm install
 
       - name: Install Playwright
         run: npx playwright install --with-deps chromium
@@ -51,27 +48,21 @@ jobs:
       - name: Run scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          FIRST_RUN: "false"      # set to "false" for normal operation
-          SEED_IF_EMPTY: "true"   # safety net: silently seed if cache was empty
-          DEBUG_LOG: "0"          # set to "1" for verbose logging
+          FIRST_RUN: "false"       # normal mode
+          SEED_IF_EMPTY: "true"    # silently seed if cache missing
+          DEBUG_LOG: "0"
         run: npm run scrape
 
-      # --- Verification: show post-state before saving to cache ---
-      - name: Show post-state (after run)
+      # (Optional) Verify state was updated
+      - name: Show post-state
         run: |
-          if [ -f state.v1.json ]; then
-            echo "::group::post-state.v1.json"
-            cat state.v1.json
-            echo "::endgroup::"
-          else
-            echo "state.v1.json not created by the run (unexpected)."
-          fi
+          [ -f state.v1.json ] && echo "::group::post-state" && cat state.v1.json && echo "::endgroup::" || echo "no state written"
 
-      # Save updated state so future runs dedupe correctly
+      # ⬇️ Save with the SAME unique key as the restore step
       - name: Save state cache
         uses: actions/cache@v4
         with:
           path: state.v1.json
-          key: state-v1-${{ github.run_id }}
+          key: state2-v1-${{ github.run_id }}
           restore-keys: |
-            state-v1-
+            state2-v1-
