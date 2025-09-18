@@ -6,31 +6,24 @@ import fs from "fs";
 import crypto from "crypto";
 import fetch from "node-fetch";
 import { chromium } from "playwright";
-import { URL as NodeURL } from "node:url";
 
-// =====================
-// Config
-// =====================
+// ----------------- Config -----------------
 const PAGE_URL = "https://appointmenttrader.com/concierge";
 
-// bump to invalidate old state file names
 const STATE_VERSION = "v1";
 const STATE_FILE = `./state.${STATE_VERSION}.json`;
 
 const WEBHOOK        = process.env.DISCORD_WEBHOOK_URL;
 const FIRST_RUN      = String(process.env.FIRST_RUN ?? "true").toLowerCase() === "true";
-const DEBUG_LOG      = String(process.env.DEBUG_LOG ?? "false").toLowerCase() === "true";
-// Safety net: if state is empty and FIRST_RUN=false, seed silently to avoid spam.
 const SEED_IF_EMPTY  = String(process.env.SEED_IF_EMPTY ?? "true").toLowerCase() === "true";
+const DEBUG_LOG      = String(process.env.DEBUG_LOG ?? "false").toLowerCase() === "true";
 
-const MAX_ITEMS         = 20;   // max cards to parse/post per run
-const STATE_TTL_DAYS    = 14;   // prune old hashes
-const DISCORD_DELAY_MS  = 750;  // ms between posts
-const HYDRATION_WAIT_MS = 2500; // ms after DOMContentLoaded
+const MAX_ITEMS         = 20;
+const STATE_TTL_DAYS    = 14;
+const DISCORD_DELAY_MS  = 750;
+const HYDRATION_WAIT_MS = 2500;
 
-// =====================
-// State helpers
-// =====================
+// ----------------- State helpers -----------------
 function loadState() {
   try {
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
@@ -52,22 +45,70 @@ function pruneOld(state) {
   }
   if (removed) console.log(`Pruned ${removed} old entries from state.`);
 }
-function normSpace(s) { return (s || "").replace(/\s+/g, " ").trim(); }
-function hashItem(obj) {
-  // Normalize to maximize stability across runs
+
+// ----------------- Hashing (backward compatible) -----------------
+const norm = s => (s || "").replace(/\s+/g, " ").trim();
+const sha = s => crypto.createHash("sha256").update(s).digest("hex").slice(0, 16);
+
+// v3 (current, stable): focuses on durable fields
+function hashV3(it) {
   const canon = {
-    p: normSpace(obj.price || ""),
-    u: normSpace(obj.user || ""),
-    d: normSpace(obj.desc || "").slice(0, 200), // partial to avoid long churn
-    w: normSpace(obj.when || ""),
-    l: normSpace(obj.link || "")
+    p: norm(it.price || ""),
+    u: norm(it.user  || ""),
+    d: norm(it.desc  || "").slice(0, 200),
+    w: norm(it.when  || ""),
+    l: norm(it.link  || "")
   };
-  return crypto.createHash("sha256").update(JSON.stringify(canon)).digest("hex").slice(0, 16);
+  return sha(JSON.stringify(canon));
 }
 
-// =====================
-// Discord
-// =====================
+// v2 (previous trending version): title+desc+when+price+link
+function hashV2(it) {
+  const canon = {
+    t: norm(it.title || ""),
+    d: norm(it.desc  || "").slice(0, 200),
+    w: norm(it.when  || ""),
+    p: norm(it.price || ""),
+    l: norm(it.link  || "")
+  };
+  return sha(JSON.stringify(canon));
+}
+
+// v1 (very early version): title+meta+when+price+link
+function hashV1(it) {
+  const canon = {
+    t: norm(it.title || ""),
+    m: norm(it.meta  || ""),  // may be empty for current items
+    w: norm(it.when  || ""),
+    p: norm(it.price || ""),
+    l: norm(it.link  || "")
+  };
+  return sha(JSON.stringify(canon));
+}
+
+function candidateIds(it) {
+  // Primary id first; legacy ids after
+  return [hashV3(it), hashV2(it), hashV1(it)];
+}
+
+function markAllHashes(state, it, ts = Date.now()) {
+  for (const id of candidateIds(it)) state.sent[id] = ts;
+}
+
+function isAlreadySeen(state, it) {
+  const ids = candidateIds(it);
+  for (const id of ids) if (state.sent[id]) return { seen: true, existingId: id, primary: ids[0] };
+  return { seen: false, existingId: null, primary: ids[0] };
+}
+
+function migrateToPrimaryIfNeeded(state, seenInfo) {
+  const { seen, existingId, primary } = seenInfo;
+  if (seen && !state.sent[primary]) {
+    state.sent[primary] = state.sent[existingId]; // migrate silently
+  }
+}
+
+// ----------------- Discord -----------------
 async function postToDiscord(items) {
   for (const it of items) {
     const titleBits = [];
@@ -141,12 +182,7 @@ async function postSummaryToDiscord(items) {
   }
 }
 
-// =====================
-// Scraping (Playwright)
-// =====================
-// Strictly scope to:
-// .home-trending-section:has(.home-trending-title span:has-text('Recently Posted Requests'))
-//   .home-trending-searches .home-trending-item
+// ----------------- Scraping -----------------
 async function scrapeFromTrending(page) {
   const section = page
     .locator(".home-trending-section:has(.home-trending-title span:has-text('Recently Posted Requests'))")
@@ -166,38 +202,32 @@ async function scrapeFromTrending(page) {
     const row = rows.nth(i);
 
     const textRaw = await row.innerText().catch(() => "");
-    const text = normSpace(textRaw);
+    const text = norm(textRaw);
     if (!text) continue;
 
     const onclick = await row.getAttribute("onclick").catch(() => null);
 
-    // pick URL: prefer visible text URL, else decode from onclick's DecodeText('...')
+    // prefer visible URL; otherwise try to decode from onclick base64
     let link = null;
     const visibleUrl = text.match(/https?:\/\/[^\s)]+/i);
-    if (visibleUrl) {
-      link = visibleUrl[0];
-    } else if (onclick) {
+    if (visibleUrl) link = visibleUrl[0];
+    else if (onclick) {
       const m = onclick.match(/DecodeText\('([^']+)'/);
       if (m && m[1]) {
         try {
           const decoded = Buffer.from(m[1], "base64").toString("utf8");
           const urlInDecoded = decoded.match(/https?:\/\/[^\s)]+/i);
           if (urlInDecoded) link = urlInDecoded[0];
-        } catch { /* ignore bad base64 */ }
+        } catch {}
       }
     }
     if (!link) link = PAGE_URL;
 
-    // parse fields
     const price = (text.match(/\$\s*[\d,]+\s*reward/i) || [])[0]?.replace(/\s*reward/i, "") || "";
     const userMatch = text.match(/posted by\s+([^:]+):/i);
-    const user = userMatch ? normSpace(userMatch[1]) : "";
-
-    // description is everything after the first colon
+    const user = userMatch ? norm(userMatch[1]) : "";
     const colonIdx = text.indexOf(":");
-    const desc = colonIdx >= 0 ? normSpace(text.slice(colonIdx + 1)) : "";
-
-    // heuristics for when
+    const desc = colonIdx >= 0 ? norm(text.slice(colonIdx + 1)) : "";
     const when =
       (text.match(/\b(Today|Tomorrow|Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b/i) || [])[0] ||
       (text.match(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}\b/i) || [])[0] ||
@@ -205,11 +235,8 @@ async function scrapeFromTrending(page) {
 
     out.push({
       title: `${price || "Request"} — ${user || "user"}`,
-      user,
-      price,
-      desc,
-      when,
-      link
+      meta: "", // legacy field (v1) stays empty for modern rows
+      user, price, desc, when, link
     });
   }
   return out;
@@ -234,16 +261,13 @@ async function scrape() {
       console.log(`Parsed ${items.length} trending item(s):`);
       for (const it of items) console.log(`• ${it.price} by ${it.user} — ${it.link}`);
     }
-
     return items;
   } finally {
     await browser.close().catch(() => {});
   }
 }
 
-// =====================
-// Main
-// =====================
+// ----------------- Main -----------------
 async function main() {
   try {
     if (!WEBHOOK) {
@@ -257,55 +281,51 @@ async function main() {
 
     const items = await scrape();
 
-    // ---------- Safety net ----------
-    const stateIsEmpty = !state.initialized && Object.keys(state.sent).length === 0;
-    if (stateIsEmpty && !FIRST_RUN && SEED_IF_EMPTY) {
+    // Safety: if cache empty but not first run, seed silently
+    const empty = !state.initialized && Object.keys(state.sent).length === 0;
+    if (empty && !FIRST_RUN && SEED_IF_EMPTY) {
       console.log("State empty and FIRST_RUN=false → seeding silently (no Discord).");
-      for (const it of items) {
-        const id = hashItem(it);
-        state.sent[id] = Date.now();
-      }
+      for (const it of items) markAllHashes(state, it);
       state.initialized = true;
       state.version = STATE_VERSION;
       state.initialized_at = new Date().toISOString();
       saveState(state);
       return;
     }
-    // -------------------------------
 
+    // FIRST RUN: post summary then seed all hash variants
     if (FIRST_RUN && !state.initialized) {
       console.log("FIRST_RUN=true and state not initialized → posting summary of current items.");
       await postSummaryToDiscord(items);
-
-      // seed state with everything currently visible
-      for (const it of items) {
-        const id = hashItem(it);
-        state.sent[id] = Date.now();
-      }
+      for (const it of items) markAllHashes(state, it);
       state.initialized = true;
       state.version = STATE_VERSION;
       state.initialized_at = new Date().toISOString();
       saveState(state);
       return;
-    } else if (FIRST_RUN && state.initialized) {
-      console.log("FIRST_RUN=true but state already initialized → normal run.");
     }
 
-    // Normal run: post only new ones
-    const newOnes = [];
+    // Migration: if any legacy hash exists, add the primary v3 id (silent, no post)
     for (const it of items) {
-      const id = hashItem(it);
-      if (!state.sent[id]) { state.sent[id] = Date.now(); newOnes.push(it); }
+      const info = isAlreadySeen(state, it);
+      if (info.seen) migrateToPrimaryIfNeeded(state, info);
     }
 
-    if (!newOnes.length) {
+    // Normal: post only truly new items
+    const fresh = [];
+    for (const it of items) {
+      const info = isAlreadySeen(state, it);
+      if (!info.seen) { markAllHashes(state, it); fresh.push(it); }
+    }
+
+    if (!fresh.length) {
       console.log("No new items.");
       saveState(state);
       return;
     }
 
-    console.log(`Posting ${newOnes.length} new request(s) to Discord…`);
-    await postToDiscord(newOnes);
+    console.log(`Posting ${fresh.length} new request(s) to Discord…`);
+    await postToDiscord(fresh);
     saveState(state);
   } catch (err) {
     console.error("Fatal error:", err?.stack || err?.message || String(err));
