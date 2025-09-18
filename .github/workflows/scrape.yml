@@ -34,7 +34,8 @@ jobs:
       - name: Run scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          FIRST_RUN: "true"    # set to "false" after the first successful seed
+          FIRST_RUN: "false"    # set to "false" after the first successful seed
+          SEED_IF_EMPTY: "true"
           DEBUG_LOG: "1"       # optional; remove later
         run: npm run scrape
 
